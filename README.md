@@ -68,5 +68,4 @@ ThriftPark stands out from competitors like Parkopedia, LTA Parking.sg, and Park
 
 ---
 
-**Expected Impact:** Average savings of 10% on parking costs per user
 
