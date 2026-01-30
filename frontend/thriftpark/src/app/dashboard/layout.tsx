@@ -36,7 +36,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       textColor: "#fff",
       links: [
         { label: "Find a Carpark", ariaLabel: "Find Carpark Lots", href: "/dashboard/carpark-search" },
-        { label: "Compare Parking", ariaLabel: "Compare costs", href: "/dashboard/costcomparison" },
+        // { label: "Compare Parking", ariaLabel: "Compare costs", href: "/dashboard/costcomparison" },
         { label: "My Parking Sessions", ariaLabel: "Parking Session", href: "/dashboard/park-session" },
         
       ],

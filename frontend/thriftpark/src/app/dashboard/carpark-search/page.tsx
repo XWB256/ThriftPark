@@ -6,7 +6,6 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import { Marker, Popup } from "react-map-gl";
 import haversine from "haversine-distance";
 import { svy21ToWgs84 } from "svy21";
-import { useRouter } from "next/navigation";
 
 const Map = dynamic(() => import("react-map-gl").then((mod) => mod.Map), {
   ssr: false,
@@ -61,7 +60,8 @@ const getParkingDuration = (start: string, end: string) => {
   if (!start || !end) return null;
   const startDate = new Date(start);
   const endDate = new Date(end);
-  const diffHours = (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60);
+  const diffHours =
+    (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60);
   if (diffHours <= 0 || diffHours > 24) return null;
   return { hours: diffHours, startDate };
 };
@@ -155,7 +155,6 @@ const filterByRadius = (
 
 export default function DirectionsPage() {
   const mapRef = useRef<any>(null);
-  const router = useRouter();
 
   const [mapLoaded, setMapLoaded] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<{
@@ -172,7 +171,7 @@ export default function DirectionsPage() {
   const [allCarparks, setAllCarparks] = useState<any[]>([]);
   const [baseCarparks, setBaseCarparks] = useState<any[]>([]);
   const [carparks, setCarparks] = useState<any[]>([]);
-  const [filters, setFilters] = useState({ sort: "proximity" });
+  const sortMode = "price";
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [parkingDuration, setParkingDuration] = useState<{
@@ -180,12 +179,18 @@ export default function DirectionsPage() {
     startDate: Date;
   } | null>(null);
   const [selectedCarpark, setSelectedCarpark] = useState<any>(null);
+  const [referenceCarpark, setReferenceCarpark] = useState<any>(null);
+  const [referenceLocked, setReferenceLocked] = useState(false);
   const [cheapestCarpark, setCheapestCarpark] = useState<any>(null);
+  const [cheapestSelection, setCheapestSelection] = useState<any>(null);
   const [loadingCarparks, setLoadingCarparks] = useState(false);
-  const [sessionModal, setSessionModal] = useState<{
-    open: boolean;
-    carpark?: any;
-  }>({ open: false });
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<any>(null);
+  const [sessionNotice, setSessionNotice] = useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
 
   const formatCostText = (cost: number | null) => {
     if (cost == null) return "N/A";
@@ -208,28 +213,33 @@ export default function DirectionsPage() {
     return null;
   };
 
-  const getSortedCarparks = (list: any[], mode: string) => {
+  const sortCarparksForDisplay = (list: any[]) => {
     const sorted = [...list];
-    if (mode === "price") {
+    if (sortMode === "price") {
       sorted.sort(
         (a, b) => (a.totalCost ?? a.rate ?? 0) - (b.totalCost ?? b.rate ?? 0)
       );
-      return sorted;
+    } else if (sortMode === "occupancy") {
+      sorted.sort((a, b) => (b.availableLots || 0) - (a.availableLots || 0));
+    } else {
+      const getDistanceValue = (cp: any) => {
+        if (typeof cp.userDistance === "number") return cp.userDistance;
+        if (typeof cp.distance === "number") return cp.distance;
+        return Number.POSITIVE_INFINITY;
+      };
+      sorted.sort((a, b) => getDistanceValue(a) - getDistanceValue(b));
     }
-    if (mode === "occupancy") {
-      sorted.sort(
-        (a, b) => (b.availableLots || 0) - (a.availableLots || 0)
-      );
-      return sorted;
-    }
-    const getDistanceValue = (cp: any) => {
-      if (typeof cp.userDistance === "number") return cp.userDistance;
-      if (typeof cp.distance === "number") return cp.distance;
-      return Number.POSITIVE_INFINITY;
-    };
-    sorted.sort((a, b) => getDistanceValue(a) - getDistanceValue(b));
     return sorted;
   };
+
+  const getCarparkDisplayName = (code?: string) => {
+    if (!code) return "Unknown Carpark";
+    const match = allCarparks.find((cp) => cp.code === code || cp.id === code);
+    return match?.name || code;
+  };
+
+  const formatHoursValue = (val: any) =>
+    typeof val === "number" ? val.toFixed(2) : val ?? "N/A";
 
   // ✅ Get current location and center map
   useEffect(() => {
@@ -250,8 +260,53 @@ export default function DirectionsPage() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = localStorage.getItem("thriftpark_user");
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        setCurrentUser(parsed?.username || null);
+      } catch (err) {
+        console.error("Failed to parse thriftpark_user", err);
+        setCurrentUser(null);
+      }
+    } else {
+      setCurrentUser(null);
+    }
+  }, []);
+
+  const fetchSessions = async () => {
+    if (!currentUser) return;
+    try {
+      const res = await fetch(
+        `http://localhost:3005/get-active-session/${currentUser}`
+      );
+      if (!res.ok) throw new Error("Failed to fetch active session");
+      const data = await res.json();
+      setActiveSession(data.activeSession || null);
+    } catch (err) {
+      console.error("Error fetching active session:", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchSessions();
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setActiveSession(null);
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
     if (!startTime || !endTime) {
       setParkingDuration(null);
+      if (!referenceLocked) {
+        setReferenceCarpark(null);
+      }
+      setCheapestSelection(null);
+      setHasSearched(false);
       return;
     }
     const duration = getParkingDuration(startTime, endTime);
@@ -260,6 +315,13 @@ export default function DirectionsPage() {
     } else {
       setParkingDuration(null);
     }
+    if (!referenceLocked) {
+      setReferenceCarpark(null);
+    }
+    setCheapestSelection(null);
+    setHasSearched(false);
+    setCheapestSelection(null);
+    setHasSearched(false);
   }, [startTime, endTime]);
 
   // ✅ Fetch suggestions from Mapbox + local carparks
@@ -330,8 +392,7 @@ export default function DirectionsPage() {
         ]);
 
         if (!publicRes.ok) throw new Error("Failed to fetch public carparks");
-        if (!privateRes.ok)
-          throw new Error("Failed to fetch private carparks");
+        if (!privateRes.ok) throw new Error("Failed to fetch private carparks");
 
         const [publicData, privateData] = await Promise.all([
           publicRes.json(),
@@ -340,7 +401,11 @@ export default function DirectionsPage() {
 
         const missingCoords: string[] = [];
 
-        const formatRecord = (cp: any, idx: number, type: "public" | "private") =>
+        const formatRecord = (
+          cp: any,
+          idx: number,
+          type: "public" | "private"
+        ) =>
           (() => {
             const coords = getCoordsFromRecord(cp);
             if (!coords) {
@@ -366,10 +431,7 @@ export default function DirectionsPage() {
               1.5;
 
             return {
-              id:
-                cp.carpark_code ||
-                cp.carpark_name ||
-                `${type}-${idx}`,
+              id: cp.carpark_code || cp.carpark_name || `${type}-${idx}`,
               name:
                 cp.address ||
                 cp.carpark_name ||
@@ -428,6 +490,8 @@ export default function DirectionsPage() {
     if (!baseCarparks.length) {
       setCarparks([]);
       setSelectedCarpark(null);
+      setReferenceCarpark(null);
+      setReferenceLocked(false);
       setCheapestCarpark(null);
       return;
     }
@@ -435,7 +499,7 @@ export default function DirectionsPage() {
     const center = searchLocation ?? currentLocation;
     const filtered = filterByRadius(baseCarparks, center, currentLocation, 500);
     const withCost = applyParkingCost(filtered, parkingDuration);
-    const sorted = getSortedCarparks(withCost, filters.sort);
+    const sorted = sortCarparksForDisplay(withCost);
 
     const existingJson = JSON.stringify(carparks);
     const sortedJson = JSON.stringify(sorted);
@@ -445,6 +509,8 @@ export default function DirectionsPage() {
 
     if (!sorted.length) {
       setSelectedCarpark(null);
+      setReferenceCarpark(null);
+      setReferenceLocked(false);
       setCheapestCarpark(null);
       return;
     }
@@ -456,9 +522,9 @@ export default function DirectionsPage() {
       return currentCost < bestCost ? cp : best;
     }, null as any);
 
-    const cheapestChanged =
-      JSON.stringify(cheapestCarpark) !== JSON.stringify(cheapest);
-    if (cheapestChanged) setCheapestCarpark(cheapest);
+    if (JSON.stringify(cheapestCarpark) !== JSON.stringify(cheapest)) {
+      setCheapestCarpark(cheapest);
+    }
 
     if (selectedCarpark) {
       const matched = sorted.find((cp) => cp.id === selectedCarpark.id);
@@ -476,28 +542,150 @@ export default function DirectionsPage() {
         setSelectedCarpark(null);
       }
     }
+
+    if (referenceCarpark) {
+      const refMatch = sorted.find((cp) => cp.id === referenceCarpark.id);
+      if (refMatch) {
+        const equals =
+          refMatch.id === referenceCarpark.id &&
+          refMatch.totalCost === referenceCarpark.totalCost &&
+          refMatch.distance === referenceCarpark.distance &&
+          refMatch.userDistance === referenceCarpark.userDistance;
+        if (!equals) {
+          setReferenceCarpark(refMatch);
+        }
+      }
+    }
   }, [
     baseCarparks,
     currentLocation,
     searchLocation,
-    filters.sort,
     selectedCarpark,
+    referenceCarpark,
     parkingDuration,
   ]);
 
-  const fallbackToLocalCarparks = (center?: { lat: number; lng: number }) => {
+  const normalizeMetaValue = (val: any) => {
+    if (val === undefined || val === null) return "";
+    return String(val).trim().toLowerCase();
+  };
+
+  const findMatchingReference = (list: any[], reference: any) => {
+    if (!reference) return null;
+    const refId = normalizeMetaValue(
+      reference.id || reference.code || reference.carpark_code
+    );
+    const refName = normalizeMetaValue(reference.name);
+
+    // Exact id/name first
+    let match =
+      list.find((cp) => {
+        const candidateId = normalizeMetaValue(
+          cp.id || cp.code || cp.carpark_code
+        );
+        const candidateName = normalizeMetaValue(cp.name);
+        return (
+          (refId && candidateId && refId === candidateId) ||
+          (refName &&
+            candidateName &&
+            (candidateName === refName ||
+              candidateName.includes(refName) ||
+              refName.includes(candidateName)))
+        );
+      }) || null;
+
+    // Proximity (if we have coords), within 50 m
+    if (!match && isLatLng(reference.lat, reference.lng)) {
+      match =
+        list.find((cp) => {
+          if (!isLatLng(cp.lat, cp.lng)) return false;
+          const d = haversine(
+            { lat: reference.lat, lon: reference.lng },
+            { lat: cp.lat, lon: cp.lng }
+          );
+          return d < 50; // treat as the same place
+        }) || null;
+    }
+    return match;
+  };
+
+  const syncReferenceWithList = (list: any[]) => {
+    if (!list?.length) {
+      if (!referenceLocked) {
+        setReferenceCarpark(null);
+        setReferenceLocked(false);
+      }
+      return false;
+    }
+
+    if (referenceCarpark) {
+      const match = findMatchingReference(list, referenceCarpark);
+      if (match) {
+        setReferenceCarpark(match);
+        if (!referenceLocked) {
+          setReferenceLocked(false);
+        }
+        return true;
+      }
+    }
+
+    if (referenceLocked) {
+      return true;
+    }
+
+    setReferenceCarpark(list[0]);
+    setReferenceLocked(false);
+    return true;
+  };
+
+  const fallbackToLocalCarparks = ({
+    center,
+    shouldSetReference = true,
+  }: {
+    center?: { lat: number; lng: number };
+    shouldSetReference?: boolean;
+  }) => {
     if (!center || !isLatLng(center.lat, center.lng) || !allCarparks.length) {
       return false;
     }
+
     setBaseCarparks([...allCarparks]);
-    return true;
+
+    const scopedList = filterByRadius(
+      allCarparks,
+      center,
+      currentLocation,
+      500
+    );
+    const withCost = applyParkingCost(scopedList, parkingDuration);
+    const sorted = sortCarparksForDisplay(withCost);
+
+    if (!shouldSetReference) {
+      return !!sorted.length;
+    }
+
+    if (!sorted.length) {
+      return false;
+    }
+
+    return syncReferenceWithList(sorted);
   };
 
   const runCarparkLookup = async (
     keyword: string,
-    options?: { fallbackCenter?: { lat: number; lng: number } }
+    options?: {
+      fallbackCenter?: { lat: number; lng: number };
+      preferredReference?: any;
+    }
   ) => {
-    const fallback = () => fallbackToLocalCarparks(options?.fallbackCenter);
+    const fallback = () =>
+      fallbackToLocalCarparks({
+        center:
+          options?.fallbackCenter ||
+          searchLocation ||
+          currentLocation ||
+          undefined,
+      });
 
     try {
       const res = await fetch("http://localhost:3002/search-carpark", {
@@ -508,14 +696,14 @@ export default function DirectionsPage() {
 
       if (!res.ok) {
         const errMsg = await res.text();
-        console.error("Backend error:", errMsg);
         if (res.status === 404) {
-          if (!fallback()) {
+          const fallbackSucceeded = fallback();
+          if (!fallbackSucceeded) {
             alert("No carparks found for this location.");
           }
-          return;
+          return fallbackSucceeded;
         }
-        throw new Error(errMsg);
+        throw new Error(errMsg || "Failed to fetch carparks.");
       }
 
       const data = await res.json();
@@ -559,55 +747,187 @@ export default function DirectionsPage() {
       }
 
       if (!nearby?.length) {
-        if (!fallback()) {
+        const fallbackSucceeded = fallback();
+        if (!fallbackSucceeded) {
           alert("No carparks found for this location.");
         }
-        return;
+        return fallbackSucceeded;
       }
 
       setBaseCarparks(nearby);
+
+      let appliedPreferred = false;
+
+      if (options?.preferredReference) {
+        const preferredMatch = findMatchingReference(
+          nearby,
+          options.preferredReference
+        );
+        if (preferredMatch) {
+          setReferenceCarpark(preferredMatch);
+          setReferenceLocked(true);
+          appliedPreferred = true;
+        }
+      }
+
+      // 🔧 NEW: fall back to "nearest to searched point" as Original Selection
+      if (!appliedPreferred && options?.fallbackCenter) {
+        const center = options.fallbackCenter;
+        const withDists = nearby
+          .filter((cp: any) => isLatLng(cp.lat, cp.lng))
+          .map((cp: any) => ({
+            ...cp,
+            __dist: haversine(
+              { lat: center.lat, lon: center.lng },
+              { lat: cp.lat, lon: cp.lng }
+            ),
+          }))
+          .sort((a: any, b: any) => a.__dist - b.__dist);
+
+        if (withDists.length) {
+          setReferenceCarpark(withDists[0]);
+          setReferenceLocked(true);
+          appliedPreferred = true;
+        }
+      }
+      // If user already locked a reference, keep it and (if possible) sync it to the new list
+      if (referenceLocked && referenceCarpark) {
+        const keep = findMatchingReference(nearby, referenceCarpark);
+        if (keep) {
+          setReferenceCarpark(keep); // sync to the object from this result set
+        }
+        // Don't set ANY other reference here; the locked one stands
+        return true;
+      }
+
+      // existing fallback stays as last resort
+      if (!appliedPreferred) {
+        syncReferenceWithList(nearby);
+      }
+
+      return true;
     } catch (err) {
       console.error("Error fetching carparks:", err);
-      if (!fallback()) {
+      const fallbackSucceeded = fallback();
+      if (!fallbackSucceeded) {
         alert("Failed to fetch carparks from backend.");
       }
+      return fallbackSucceeded;
     }
   };
 
-  const focusOnCarpark = (cp: any) => {
+  const focusOnCarpark = (cp: any, options?: { setReference?: boolean }) => {
     if (!cp) return;
     setSelectedCarpark(cp);
+    if (options?.setReference) {
+      setReferenceCarpark(cp);
+      setReferenceLocked(true);
+    }
     if (mapRef.current) {
       mapRef.current.flyTo({ center: [cp.lng, cp.lat], zoom: 16 });
     }
   };
 
-  const openSessionModal = (cp: any) => {
-    setSessionModal({ open: true, carpark: cp });
+  const handleCheapestCarparkClick = () => {
+    if (!cheapestCarpark) return;
+    focusOnCarpark(cheapestCarpark, { setReference: false });
+    setCheapestSelection(cheapestCarpark);
   };
 
-  const closeSessionModal = () => setSessionModal({ open: false, carpark: null });
+  const startParkingSession = async (cp: any) => {
+    if (!cp) return;
 
-  const confirmSessionStart = () => {
-    if (!sessionModal.carpark) return;
-    const payload = {
-      timestamp: Date.now(),
-      selectedCarpark: sessionModal.carpark,
-      cheapestCarpark,
-      duration: parkingDuration,
-      startTime,
-      endTime,
-    };
-    try {
-      sessionStorage.setItem(
-        "pendingParkingSession",
-        JSON.stringify(payload)
+    // Prevent starting another session if one is already active
+    if (activeSession) {
+      alert(
+        "You already have an active parking session. Please end it before starting a new one."
       );
-    } catch (err) {
-      console.error("Failed to persist session payload", err);
+      return;
     }
-    closeSessionModal();
-    router.push("/dashboard/park-session");
+    // No user detected
+    if (!currentUser) {
+      alert("Please log in before starting a session.");
+      return;
+    }
+    // Invalid Start and End time
+    if (!parkingDuration || parkingDuration.hours <= 0) {
+      alert("Please enter a valid start and end time first.");
+      return;
+    }
+
+    const now = new Date();
+    const actualRate = cp.rate ?? deriveRateFromRecord(cp);
+    const estimatedCharge = parseFloat(
+      (cp.totalCost ?? actualRate * parkingDuration.hours).toFixed(2)
+    );
+
+    if (!referenceCarpark) {
+      alert(
+        "We couldn't determine the original carpark rate. Please search again."
+      );
+      return;
+    }
+
+    const referenceRate = referenceCarpark.rate ?? actualRate;
+
+    // --- Create session payload ---
+    const payload = {
+      username: currentUser,
+      parking_date: now.toISOString().split("T")[0],
+      carpark_code: cp.code || cp.id || cp.name || "UNKNOWN",
+      parking_planned_hours: parkingDuration.hours,
+      parking_estimated_charge: estimatedCharge,
+      parking_start_time: now.toISOString().slice(0, 19).replace("T", " "),
+      parking_end_time: null,
+      parking_actual_hours: null,
+      original_parking_rate: referenceRate,
+      parking_savings: null,
+    };
+
+    try {
+      // 1️⃣ Create the session in DB
+      const createRes = await fetch("http://localhost:3005/create-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!createRes.ok) {
+        const text = await createRes.text();
+        throw new Error(`Failed to create session: ${text}`);
+      }
+
+      // 2️⃣ Mark it as active and update rates
+      const startPayload = {
+        username: currentUser,
+        parking_charge: actualRate, // actual rate for chosen carpark
+        parking_priv_charge: referenceRate, // reference/original rate
+      };
+
+      const startRes = await fetch("http://localhost:3005/start-session", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(startPayload),
+      });
+
+      if (!startRes.ok) {
+        const text = await startRes.text();
+        throw new Error(`Failed to start session: ${text}`);
+      }
+
+      await fetchSessions();
+
+      setSessionNotice({
+        type: "success",
+        message: `🚗 Session started at ${cp.name}.`,
+      });
+    } catch (err: any) {
+      console.error("Error starting session:", err);
+      setSessionNotice({
+        type: "error",
+        message: err?.message || "Failed to start session.",
+      });
+    }
   };
 
   // ✅ Handle carpark search
@@ -621,11 +941,19 @@ export default function DirectionsPage() {
       return alert("Duration must be less than 24 hours and end after start.");
     }
     setParkingDuration(duration);
+    setCheapestSelection(null);
 
     console.log("🔍 Searching carparks near:", searchLocation);
-    await runCarparkLookup(searchLocation.name, {
+    const lookupSucceeded = await runCarparkLookup(searchLocation.name, {
       fallbackCenter: { lat: searchLocation.lat, lng: searchLocation.lng },
+      preferredReference: {
+        id: `user-selected-${searchLocation.name}`,
+        name: searchLocation.name,
+        lat: searchLocation.lat,
+        lng: searchLocation.lng,
+      },
     });
+    setHasSearched(!!lookupSucceeded);
 
     if (mapRef.current) {
       mapRef.current.flyTo({
@@ -642,12 +970,49 @@ export default function DirectionsPage() {
     setSearchLocation(loc);
     setDestinationInput(s.place_name);
     setSuggestions([]);
+    setCheapestSelection(null);
+    setHasSearched(false);
+
+    // Treat the user's chosen place as the Original selection
+    if (s.source === "carpark" && s.carpark) {
+      // If they clicked a specific carpark suggestion, lock THAT as original
+      setReferenceCarpark(s.carpark);
+      setReferenceLocked(true);
+    } else {
+      // If they clicked a generic Mapbox place, lock THAT place as original
+      setReferenceCarpark({
+        id: `user-selected-${loc.name}`,
+        name: loc.name,
+        lat: loc.lat,
+        lng: loc.lng,
+      });
+      setReferenceLocked(true);
+    }
 
     if (s.source === "carpark" && s.carpark) {
-      fallbackToLocalCarparks(loc);
-      focusOnCarpark(s.carpark);
+      fallbackToLocalCarparks({ center: loc, shouldSetReference: false });
+      focusOnCarpark(s.carpark, { setReference: true });
     } else {
-      runCarparkLookup(loc.name, { fallbackCenter: loc });
+      let matchedCarpark: any = null;
+      const baseName = s.place_name?.split(",")[0]?.trim().toLowerCase();
+      if (baseName && allCarparks.length) {
+        matchedCarpark =
+          allCarparks.find((cp) => cp.name?.toLowerCase() === baseName) ||
+          allCarparks.find((cp) => cp.name?.toLowerCase().includes(baseName));
+        if (matchedCarpark) {
+          focusOnCarpark(matchedCarpark, { setReference: true });
+        } else {
+          setReferenceCarpark(null);
+          setReferenceLocked(false);
+        }
+      } else {
+        setReferenceCarpark(null);
+        setReferenceLocked(false);
+      }
+      runCarparkLookup(loc.name, {
+        fallbackCenter: loc,
+        preferredReference: matchedCarpark || undefined,
+      });
     }
 
     if (mapRef.current) {
@@ -655,18 +1020,60 @@ export default function DirectionsPage() {
     }
   };
 
-  const selectedCostValue = getCarparkCostValue(selectedCarpark);
+  const endActiveSession = async () => {
+    if (!activeSession) return;
+    try {
+      const res = await fetch("http://localhost:3005/end-session", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: activeSession.username,
+          parking_start_time: activeSession.parking_start_time,
+          parking_planned_hours: activeSession.parking_planned_hours,
+          parking_charge:
+            activeSession.parking_charge ??
+            activeSession.parking_estimated_charge,
+          parking_priv_charge:
+            activeSession.parking_priv_charge ??
+            activeSession.original_parking_rate ??
+            activeSession.parking_estimated_charge ??
+            activeSession.parking_charge,
+        }),
+      });
+
+      if (!res.ok) throw new Error("Failed to end session");
+      await fetchSessions();
+      setSessionNotice({
+        type: "success",
+        message: "Session ended successfully.",
+      });
+    } catch (err: any) {
+      console.error("Error ending session:", err);
+      setSessionNotice({
+        type: "error",
+        message: err?.message || "Failed to end session.",
+      });
+    }
+  };
+
+  const referenceCostValue = getCarparkCostValue(referenceCarpark);
   const cheapestCostValue = getCarparkCostValue(cheapestCarpark);
   const costDifference =
-    selectedCostValue != null && cheapestCostValue != null
-      ? parseFloat((selectedCostValue - cheapestCostValue).toFixed(2))
+    referenceCostValue != null && cheapestCostValue != null
+      ? parseFloat((referenceCostValue - cheapestCostValue).toFixed(2))
       : null;
+  const referenceLabel =
+    referenceCarpark?.name ||
+    searchLocation?.name?.split(",")[0] ||
+    destinationInput ||
+    "your selection";
   const cheaperAvailable =
-    !!selectedCarpark &&
+    !!referenceCarpark &&
     !!cheapestCarpark &&
-    cheapestCarpark.id !== selectedCarpark.id &&
+    referenceCarpark.id !== cheapestCarpark.id &&
     costDifference !== null &&
     costDifference > 0.01;
+  const canStartSession = !!referenceCarpark && !!cheapestCarpark;
 
   return (
     <div className="flex flex-col min-h-screen px-4 sm:px-8 text-white pt-28 sm:pt-32 bg-[#0b0b0b]">
@@ -720,65 +1127,89 @@ export default function DirectionsPage() {
         </button>
       </div>
 
-      {/* Filters */}
-      <div className="flex justify-center mt-4 gap-4">
-        <select
-          value={filters.sort}
-          onChange={(e) => setFilters({ sort: e.target.value })}
-          className="p-2 bg-white/10 border border-white/30 text-white rounded-lg"
+      {hasSearched && referenceCarpark && cheapestCarpark && (
+        <div className="max-w-3xl mx-auto mt-4">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 rounded-2xl border border-white/15 bg-white/5 px-4 py-4 text-sm sm:text-base">
+            {/* --- Comparison table --- */}
+            <div className="flex-1 space-y-4">
+              {/* Original selection */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div>
+                  <p className="text-[11px] uppercase tracking-wide text-white/50">
+                    Original selection
+                  </p>
+                  <p className="font-semibold text-white">{referenceLabel}</p>
+                </div>
+                <div className="text-white/80">
+                  {formatCostText(referenceCostValue)}
+                </div>
+              </div>
+
+              <div className="h-px w-full bg-white/10" />
+
+              {/* Cheapest nearby */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div>
+                  <p className="text-[11px] uppercase tracking-wide text-white/50">
+                    Cheapest nearby
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleCheapestCarparkClick}
+                    className="font-semibold underline decoration-dotted hover:decoration-solid"
+                  >
+                    {cheapestCarpark.name}
+                  </button>
+                </div>
+                <div className="flex flex-col items-start sm:items-end text-white/80">
+                  <span>{formatCostText(cheapestCostValue)}</span>
+                  {costDifference !== null && (
+                    <span
+                      className={`text-xs ${
+                        cheaperAvailable ? "text-emerald-300" : "text-white/60"
+                      }`}
+                    >
+                      {cheaperAvailable
+                        ? `Save $${costDifference.toFixed(2)}`
+                        : "Same price"}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* --- Start Session button on right --- */}
+            {canStartSession && (
+              <button
+                type="button"
+                onClick={() => startParkingSession(cheapestCarpark)}
+                className="self-center sm:self-auto px-5 py-2 rounded-xl bg-emerald-500/20 text-emerald-200 border border-emerald-400 hover:bg-emerald-500/40 text-sm font-medium transition"
+              >
+                Start Session
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="mt-2 space-y-4"></div>
+      {sessionNotice && (
+        <div
+          className={`p-4 rounded-xl border text-sm ${
+            sessionNotice.type === "success"
+              ? "bg-emerald-500/15 border-emerald-400 text-emerald-100"
+              : "bg-red-500/15 border-red-400 text-red-100"
+          }`}
         >
-          <option value="proximity">Nearest</option>
-          <option value="price">Lowest Price</option>
-          <option value="occupancy">Most Lots</option>
-        </select>
-      </div>
-      {cheapestCarpark && (
-        <div className="mt-3 text-center text-sm text-white/80 space-x-1">
-          {selectedCarpark ? (
-            cheaperAvailable ? (
-              <>
-                <span>Cheapest nearby:</span>
-                <button
-                  type="button"
-                  onClick={() => focusOnCarpark(cheapestCarpark)}
-                  className="font-semibold underline decoration-dotted hover:decoration-solid"
-                >
-                  {cheapestCarpark.name}
-                </button>
-                <span>
-                  saves ${costDifference!.toFixed(2)} vs {selectedCarpark.name} (
-                  {formatCostText(cheapestCostValue)})
-                </span>
-              </>
-            ) : (
-              <>
-                <span className="font-semibold">{selectedCarpark.name}</span>
-                <span>
-                  is already the cheapest nearby (
-                  {formatCostText(selectedCostValue)}).
-                </span>
-              </>
-            )
-          ) : (
-            <>
-              <span>Cheapest nearby:</span>
-              <button
-                type="button"
-                onClick={() => focusOnCarpark(cheapestCarpark)}
-                className="font-semibold underline decoration-dotted hover:decoration-solid"
-              >
-                {cheapestCarpark.name}
-              </button>
-              <span>• {formatCostText(cheapestCostValue)}</span>
-              <button
-                type="button"
-                onClick={() => openSessionModal(cheapestCarpark)}
-                className="ml-2 px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-200 text-xs border border-emerald-400 hover:bg-emerald-500/40"
-              >
-                Start session
-              </button>
-            </>
-          )}
+          <div className="flex justify-between items-center gap-4">
+            <span>{sessionNotice.message}</span>
+            <button
+              type="button"
+              onClick={() => setSessionNotice(null)}
+              className="text-xs uppercase tracking-wide"
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
       {loadingCarparks && (
@@ -788,7 +1219,7 @@ export default function DirectionsPage() {
       )}
 
       {/* Map */}
-      <div className="mt-8 h-[70vh] rounded-xl overflow-hidden border border-white/20 shadow-lg relative">
+      <div className="mt-2 h-[70vh] rounded-xl overflow-hidden border border-white/20 shadow-lg relative">
         <Map
           ref={mapRef}
           mapboxAccessToken={process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
@@ -898,76 +1329,61 @@ export default function DirectionsPage() {
                 >
                   🚗 Get Directions
                 </a>
-                <button
-                  type="button"
-                  onClick={() => openSessionModal(selectedCarpark)}
-                  className="inline-block mt-2 px-3 py-1 bg-emerald-500 text-white rounded-lg font-semibold hover:bg-emerald-600 transition w-full"
-                >
-                  ⏱️ Start Parking Session
-                </button>
               </div>
             </Popup>
           )}
         </Map>
       </div>
 
-      {sessionModal.open && sessionModal.carpark && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-white text-black rounded-2xl shadow-2xl max-w-md w-full mx-4 p-6 space-y-4">
-            <h3 className="text-xl font-bold">Start Parking Session</h3>
-            <p className="text-sm text-gray-600">
-              You are about to start a session at{" "}
-              <span className="font-semibold">{sessionModal.carpark.name}</span>
-              .
-            </p>
-            {cheaperAvailable && cheapestCarpark && (
-              <div className="bg-gray-100 rounded-lg p-3 text-sm space-y-1">
-                <p>
-                  Selected:{" "}
-                  <span className="font-semibold">
-                    {sessionModal.carpark.name}
-                  </span>{" "}
-                  ({formatCostText(getCarparkCostValue(sessionModal.carpark))})
-                </p>
-                <p>
-                  Cheapest nearby:{" "}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      focusOnCarpark(cheapestCarpark);
-                      openSessionModal(cheapestCarpark);
-                    }}
-                    className="font-semibold underline decoration-dotted hover:decoration-solid"
-                  >
-                    {cheapestCarpark.name}
-                  </button>{" "}
-                  ({formatCostText(cheapestCostValue)})
-                </p>
-              </div>
+      <div className="mt-6 space-y-4">
+        <div className="border border-white/20 rounded-xl p-4 bg-white/5 text-sm text-white/80 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg text-white font-semibold">Active Session</h2>
+            {currentUser ? (
+              <span className="text-xs text-white/60">
+                Signed in as {currentUser}
+              </span>
+            ) : (
+              <span className="text-xs text-red-200">
+                Log in to enable sessions
+              </span>
             )}
-            <p className="text-xs text-gray-500">
-              You’ll be redirected to the Park Session page to complete the
-              workflow.
-            </p>
-            <div className="flex flex-col sm:flex-row gap-3">
+          </div>
+
+          {activeSession ? (
+            <div className="space-y-2">
+              <p>
+                Carpark:{" "}
+                <span className="font-semibold">
+                  {getCarparkDisplayName(activeSession.carpark_code)}
+                </span>
+              </p>
+              <p>
+                Planned hours:{" "}
+                {formatHoursValue(activeSession.parking_planned_hours)}
+              </p>
+              <p>
+                Started:{" "}
+                {activeSession.parking_start_time
+                  ? new Date(activeSession.parking_start_time).toLocaleString()
+                  : "Processing..."}
+              </p>
               <button
                 type="button"
-                onClick={confirmSessionStart}
-                className="flex-1 bg-emerald-500 text-white py-2 rounded-lg font-semibold hover:bg-emerald-600"
+                onClick={endActiveSession}
+                className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded"
               >
-                Confirm &amp; Continue
-              </button>
-              <button
-                type="button"
-                onClick={closeSessionModal}
-                className="flex-1 bg-gray-200 text-gray-800 py-2 rounded-lg font-semibold hover:bg-gray-300"
-              >
-                Cancel
+                End Session
               </button>
             </div>
-          </div>
+          ) : (
+            <p className="text-white/60 text-sm">
+              No active parking session. Select a carpark above and tap "Start
+              Session" to begin.
+            </p>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }

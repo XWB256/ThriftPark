@@ -59,25 +59,139 @@ const safeParseFloat = (value) => {
   return Number.isNaN(parsed) ? null : parsed;
 };
 
-const geocodeAddress = async (query) => {
+// === Geocoding: shared constants/helpers ===
+// Singapore bounding box (rough): SW[103.602,1.130], NE[104.116,1.474]
+const SG_BBOX = [103.602, 1.130, 104.116, 1.474];
+/** Geocoding helper: ensure a coordinate lies within Singapore. */
+const inSgBbox = (lat, lng) =>
+  typeof lat === "number" &&
+  typeof lng === "number" &&
+  lng >= SG_BBOX[0] &&
+  lng <= SG_BBOX[2] &&
+  lat >= SG_BBOX[1] &&
+  lat <= SG_BBOX[3];
+
+// === Geocoding provider: OneMap SG ===
+// OneMap SG (public endpoints) — no token required for common search
+const ONEMAP_BASE = "https://developers.onemap.sg";
+
+/**
+ * geocodeOneMap(query)
+ * OneMap-first geocoding of a free‑text place string.
+ * Returns { lat, lng } on success, or null when not found.
+ */
+async function geocodeOneMap(query) {
   if (!query) return null;
+
+  // Try placesearch (POI) first
+  const buildUrl = (endpoint) => {
+    const params = new URLSearchParams({
+      searchVal: query,
+      returnGeom: "Y",
+      getAddrDetails: "Y",
+      pageNum: "1",
+    });
+    return `${ONEMAP_BASE}/commonapi/${endpoint}?${params.toString()}`;
+  };
+
+  const endpoints = ["placesearch", "search"];
+  for (const ep of endpoints) {
+    try {
+      const resp = await fetch(buildUrl(ep));
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const results = Array.isArray(data.results) ? data.results : [];
+      if (!results.length) continue;
+
+      // Heuristics: prefer entries with BUILDING or CATEGORY akin to carparks/malls
+      const score = (r) => {
+        const cat = (r.CATEGORY || "").toLowerCase();
+        const bld = (r.BUILDING || r.SEARCHVAL || "").toLowerCase();
+        let s = 0;
+        if (cat.includes("shopping") || cat.includes("mall")) s += 2;
+        if (bld.includes("car park") || bld.includes("carpark")) s += 2;
+        if (cat.includes("car park")) s += 2;
+        if (bld) s += 1;
+        return s;
+      };
+      results.sort((a, b) => score(b) - score(a));
+
+      for (const r of results) {
+        const lat = parseFloat(r.LATITUDE);
+        const lng = parseFloat(r.LONGITUDE);
+        if (Number.isFinite(lat) && Number.isFinite(lng) && inSgBbox(lat, lng)) {
+          return { lat, lng };
+        }
+      }
+    } catch (e) {
+      // Keep trying other endpoint / fallbacks
+      console.warn("[OneMap] geocode error for", query, e.message || e);
+    }
+  }
+  return null;
+}
+
+// === Unified Geocoder (OneMap → Mapbox fallback) ===
+/**
+ * geocodeAddress(query, opts)
+ * Unified entry used by uploads and maintenance endpoints.
+ * - Calls OneMap SG first.
+ * - Falls back to Mapbox (POI-only, SG-bounded) when available.
+ * - Caches results per (query, opts).
+ * Returns { lat, lng } or null.
+ */
+const geocodeAddress = async (
+  query,
+  opts = {
+    limit: 5,
+    types: "poi",
+    minRelevance: 0.7,
+    bbox: SG_BBOX,
+  }
+) => {
+  if (!query) return null;
+  // Try OneMap first regardless of Mapbox token
+  const cacheKey = `${query}|${opts.types}|${opts.limit}`;
+  if (geocodeCache.has(cacheKey)) {
+    return geocodeCache.get(cacheKey);
+  }
+
+  try {
+    const om = await geocodeOneMap(query);
+    if (om && inSgBbox(om.lat, om.lng)) {
+      geocodeCache.set(cacheKey, om);
+      return om;
+    }
+  } catch (e) {
+    console.warn("[OneMap] initial lookup failed for", query, e.message || e);
+  }
+
+  // If no Mapbox token, we can't try Mapbox fallback
   if (!MAPBOX_TOKEN) {
     if (!mapboxWarningLogged) {
-      console.warn(
-        "[Geocode] MAPBOX_TOKEN not set. Private carpark coordinates will be empty."
-      );
+      console.warn("[Geocode] MAPBOX_TOKEN not set. Using OneMap only.");
       mapboxWarningLogged = true;
     }
+    geocodeCache.set(cacheKey, null);
     return null;
   }
 
-  if (geocodeCache.has(query)) {
-    return geocodeCache.get(query);
+  const params = new URLSearchParams({
+    country: "SG",
+    limit: String(opts.limit ?? 5),
+    types: opts.types ?? "poi",
+    language: "en",
+    access_token: MAPBOX_TOKEN,
+  });
+  if (opts.bbox && Array.isArray(opts.bbox) && opts.bbox.length === 4) {
+    params.set("bbox", opts.bbox.join(","));
   }
+  // prefer exact matches over fuzzy
+  params.set("autocomplete", "false");
 
   const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(
     query
-  )}.json?country=SG&limit=1&types=poi,address&access_token=${MAPBOX_TOKEN}`;
+  )}.json?${params.toString()}`;
 
   try {
     const response = await fetch(url);
@@ -85,30 +199,57 @@ const geocodeAddress = async (query) => {
       throw new Error(`Mapbox error ${response.status}`);
     }
     const data = await response.json();
-    const feature = data.features?.[0];
-    const coords = feature?.center
-      ? { lat: feature.center[1], lng: feature.center[0] }
+    const features = Array.isArray(data.features) ? data.features : [];
+
+    // Keep only POIs within SG bbox and with decent relevance
+    const minRel = opts.minRelevance ?? 0.7;
+    const inBbox = (c) =>
+      c &&
+      c[0] >= SG_BBOX[0] &&
+      c[0] <= SG_BBOX[2] &&
+      c[1] >= SG_BBOX[1] &&
+      c[1] <= SG_BBOX[3];
+
+    const filtered = features
+      .filter((f) =>
+        Array.isArray(f.place_type) &&
+        f.place_type.includes("poi") &&
+        typeof f.relevance === "number" &&
+        f.relevance >= minRel &&
+        Array.isArray(f.center) &&
+        inBbox(f.center)
+      )
+      // prefer higher relevance, then closer to the middle of SG to avoid off-country results
+      .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0));
+
+    const chosen = filtered[0] || null;
+    let coords = chosen?.center
+      ? { lat: chosen.center[1], lng: chosen.center[0] }
       : null;
-    geocodeCache.set(query, coords);
+
+    geocodeCache.set(cacheKey, coords);
     return coords;
   } catch (err) {
     console.error("[Geocode] Failed for query:", query, err.message || err);
-    geocodeCache.set(query, null);
+    geocodeCache.set(cacheKey, null);
     return null;
   }
 };
 
+// === Geocoding query builder (private carparks) ===
+/**
+ * formatPrivateCarparkQuery(row)
+ * Build a clean geocoding string: "<name>, Singapore".
+ * Avoids region/category terms that bias generic centroids.
+ */
 const formatPrivateCarparkQuery = (row) => {
-  const parts = [];
-  const name = row.carpark || row.carpark_name;
-  if (name) parts.push(name);
-  if (row.category || row.carpark_category) {
-    parts.push(row.category || row.carpark_category);
-  }
-  parts.push("Singapore");
-  return parts.join(", ");
+  // Use only the place name and country; region/category terms like "West"
+  // cause Mapbox to return a generic centroid repeatedly.
+  const name = row.carpark || row.carpark_name || "";
+  return `${name}, Singapore`;
 };
 
+// === Coordinate conversion (SVY21 → WGS84) — not geocoding ===
 const convertCoordPair = (xCoord, yCoord, meta = {}) => {
   const easting = typeof xCoord === "string" ? parseFloat(xCoord) : xCoord;
   const northing = typeof yCoord === "string" ? parseFloat(yCoord) : yCoord;
@@ -277,11 +418,31 @@ app.post("/upload-private-carparks", upload.single("file"), (req, res) => {
           const sunday = safeParseFloat(row.sunday_ph_rate);
 
           let coords = null;
-          const formattedQuery = formatPrivateCarparkQuery(row);
-          coords = await geocodeAddress(formattedQuery);
+          const baseQuery = formatPrivateCarparkQuery(row);
+          // 1) Try strict POI search (Mapbox → OneMap fallback baked in)
+          coords = await geocodeAddress(baseQuery, {
+            limit: 5,
+            types: "poi",
+            minRelevance: 0.8,
+            bbox: SG_BBOX,
+          });
 
+          // 2) Fallback: add common parking terms
           if (!coords && row.carpark) {
-            coords = await geocodeAddress(`${row.carpark}, Singapore`);
+            const attempts = [
+              `${row.carpark} car park, Singapore`,
+              `${row.carpark} parking, Singapore`,
+              `${row.carpark} mall, Singapore`,
+            ];
+            for (const q of attempts) {
+              coords = await geocodeAddress(q, {
+                limit: 5,
+                types: "poi",
+                minRelevance: 0.7,
+                bbox: SG_BBOX,
+              });
+              if (coords) break;
+            }
           }
 
           if (!coords) {
@@ -367,9 +528,7 @@ app.get("/get-private-carpark-list", (req, res) => {
       return res.status(500).send("Error getting private carpark list");
     }
 
-    return res
-      .status(200)
-      .json({ message: "private carparks: ", results });
+    return res.status(200).json({ message: "private carparks: ", results });
   });
 });
 
@@ -500,9 +659,11 @@ app.post("/search-carpark", (req, res) => {
 
 app.post("/geocode-private-carparks", async (req, res) => {
   try {
-    const rows = await runQuery(
-      `SELECT carpark_name, carpark_category FROM priv_carpark_info WHERE latitude_wgs84 IS NULL OR longitude_wgs84 IS NULL`
-    );
+    const overwrite = req.query.overwrite === "1" || req.body?.overwrite === true;
+    const selector = overwrite
+      ? `SELECT carpark_name, carpark_category FROM priv_carpark_info`
+      : `SELECT carpark_name, carpark_category FROM priv_carpark_info WHERE latitude_wgs84 IS NULL OR longitude_wgs84 IS NULL`;
+    const rows = await runQuery(selector);
 
     if (!rows.length) {
       return res
@@ -514,9 +675,27 @@ app.post("/geocode-private-carparks", async (req, res) => {
     const failed = [];
 
     for (const row of rows) {
-      let coords = await geocodeAddress(formatPrivateCarparkQuery(row));
+      let coords = await geocodeAddress(formatPrivateCarparkQuery(row), {
+        limit: 5,
+        types: "poi",
+        minRelevance: 0.8,
+        bbox: SG_BBOX,
+      });
       if (!coords) {
-        coords = await geocodeAddress(`${row.carpark_name}, Singapore`);
+        const attempts = [
+          `${row.carpark_name} car park, Singapore`,
+          `${row.carpark_name} parking, Singapore`,
+          `${row.carpark_name} mall, Singapore`,
+        ];
+        for (const q of attempts) {
+          coords = await geocodeAddress(q, {
+            limit: 5,
+            types: "poi",
+            minRelevance: 0.7,
+            bbox: SG_BBOX,
+          });
+          if (coords) break;
+        }
       }
 
       if (coords) {
