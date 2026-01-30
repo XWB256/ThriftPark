@@ -1,0 +1,27 @@
+{
+  "name": "svy21",
+  "version": "1.0.0",
+  "description": "svy21 to wgs84 and vice versa",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phonglk/SVY21.git"
+  },
+  "keywords": [
+    "svy21",
+    "wgs84",
+    "singapore",
+    "coordinates",
+    "lat",
+    "lng"
+  ],
+  "author": "Khoi-Phong Le",
+  "license": "SEE LICENSE IN LICENSE",
+  "bugs": {
+    "url": "https://github.com/phonglk/SVY21/issues"
+  },
+  "homepage": "https://github.com/phonglk/SVY21#readme"
+}
